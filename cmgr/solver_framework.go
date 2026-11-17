@@ -143,7 +143,7 @@ func (m *Manager) executeSolver(cMeta *ChallengeMetadata, bMeta *BuildMetadata, 
 	hConfig := container.HostConfig{}
 	if m.hostOSType == "linux" {
 		m.log.debug("inserting custom seccomp profile")
-		hConfig.SecurityOpt = []string{"seccomp:" + seccompPolicy}
+		hConfig.SecurityOpt = []string{seccompSecurityOpt(seccompPolicy)}
 	}
 
 	// With no instance network (non-service builds) the solver runs on Docker's

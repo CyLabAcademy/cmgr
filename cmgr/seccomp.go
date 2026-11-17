@@ -70,6 +70,13 @@ func (opts *SeccompOptions) resolve(challengeDir string) error {
 	return nil
 }
 
+// seccompSecurityOpt passes profile to Docker as a security option. Docker
+// splits an option at its first '=' when it has one, so the ':' form breaks on
+// any profile containing '='.
+func seccompSecurityOpt(profile string) string {
+	return "seccomp=" + profile
+}
+
 // validateSeccompProfileFilename constrains profiles to a plain JSON file
 // beside the challenge metadata. Names beginning with '.' are rejected in
 // particular because checksumIgnore skips them, so a hidden profile would not

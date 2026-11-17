@@ -192,6 +192,21 @@ func TestEmbeddedPolicyPassesProfileValidation(t *testing.T) {
 	}
 }
 
+// A per-syscall "comment" is valid Docker profile syntax that validation
+// ignores, so an '=' in one reaches the security option and must not move
+// where Docker splits it.
+func TestSeccompSecurityOptKeepsProfileWithEquals(t *testing.T) {
+	profile := strings.Replace(testSeccompProfile, `"action"`, `"comment": "persona=0xffffffff only queries", "action"`, 1)
+	if err := validateSeccompProfile(profile); err != nil {
+		t.Fatalf("profile with a comment was rejected: %s", err)
+	}
+	// Docker's parseSecurityOpt cuts at the first '=' whenever there is one.
+	key, value, _ := strings.Cut(seccompSecurityOpt(profile), "=")
+	if key != "seccomp" || value != profile {
+		t.Fatalf("security option splits into key %q and a %d-byte value; expected seccomp and the %d-byte profile", key, len(value), len(profile))
+	}
+}
+
 // Challenge options arrive as JSON from problem.json and as YAML from
 // problem.md, so the option must decode through both paths.
 func TestSeccompOptionParsesFromChallengeMetadata(t *testing.T) {

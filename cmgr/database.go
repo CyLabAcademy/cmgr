@@ -9,6 +9,7 @@ import (
 	"os"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -130,8 +131,10 @@ const schemaQuery string = `
 			ON UPDATE RESTRICT ON DELETE CASCADE
 	);
 
+	-- AUTOINCREMENT: an id is never handed out twice, since front-ends hold
+	-- ids after cmgr deletes the row.
 	CREATE TABLE IF NOT EXISTS instances (
-		id INTEGER PRIMARY KEY,
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		lastsolved INTEGER,
 		build INTEGER NOT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -331,7 +334,17 @@ func (m *Manager) initDatabase() error {
 	}
 	staleIsFinalizedDefault := isFinalizedCols > 0 && isFinalizedDefault.String != "0"
 
-	if createdAtCols == 0 || isFinalizedCols == 0 || staleIsFinalizedDefault {
+	// No ALTER adds AUTOINCREMENT, so a table declared without it (the
+	// stored declaration shows) is rebuilt too.
+	var instancesSQL string
+	err = db.QueryRow("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'instances';").Scan(&instancesSQL)
+	if err != nil {
+		m.log.errorf("could not read the instances table declaration: %s", err)
+		return err
+	}
+	hasAutoincrement := strings.Contains(strings.ToUpper(instancesSQL), "AUTOINCREMENT")
+
+	if createdAtCols == 0 || isFinalizedCols == 0 || staleIsFinalizedDefault || !hasAutoincrement {
 		if err = rebuildInstancesTable(db, createdAtCols > 0, isFinalizedCols > 0); err != nil {
 			m.log.errorf("could not migrate instances table: %s", err)
 			return err
@@ -373,7 +386,8 @@ func (m *Manager) initDatabase() error {
 // schema and copies existing rows across. It migrates databases that predate
 // the created_at and/or is_finalized columns, which cannot simply be added via
 // ALTER TABLE ... ADD COLUMN because created_at's DEFAULT CURRENT_TIMESTAMP is a
-// non-constant default that SQLite rejects in ADD COLUMN.
+// non-constant default that SQLite rejects in ADD COLUMN, and databases whose
+// id column lacks AUTOINCREMENT, which no ALTER can add.
 //
 // `instances` is the target of ON DELETE CASCADE foreign keys (portAssignments,
 // containers), so the implicit DELETE that DROP TABLE performs would cascade and
@@ -410,7 +424,7 @@ func rebuildInstancesTable(db *sqlx.DB, hasCreatedAt, hasIsFinalized bool) (retE
 	defer tx.Rollback()
 
 	const createNew = `CREATE TABLE instances_migrate_new (
-		id INTEGER PRIMARY KEY,
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		lastsolved INTEGER,
 		build INTEGER NOT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -445,10 +459,26 @@ func rebuildInstancesTable(db *sqlx.DB, hasCreatedAt, hasIsFinalized bool) (retE
 		return err
 	}
 
+	// A table already declared with AUTOINCREMENT keeps its high-water mark
+	// in sqlite_sequence, and DROP TABLE deletes that row: read it first.
+	var prevSeq int64
+	if err = tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(seq), 0) FROM sqlite_sequence WHERE name = 'instances';").Scan(&prevSeq); err != nil {
+		return err
+	}
+
 	if _, err = tx.ExecContext(ctx, "DROP TABLE instances;"); err != nil {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, "ALTER TABLE instances_migrate_new RENAME TO instances;"); err != nil {
+		return err
+	}
+
+	// Continue the numbering above every id handed out so far: the old
+	// high-water mark or, for a table without one, the largest id copied.
+	if _, err = tx.ExecContext(ctx, "DELETE FROM sqlite_sequence WHERE name IN ('instances', 'instances_migrate_new');"); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, "INSERT INTO sqlite_sequence(name, seq) SELECT 'instances', MAX(?, COALESCE(MAX(id), 0)) FROM instances;", prevSeq); err != nil {
 		return err
 	}
 
@@ -461,40 +491,49 @@ func rebuildInstancesTable(db *sqlx.DB, hasCreatedAt, hasIsFinalized bool) (retE
 	}
 
 	// Confirm the rebuild left no dangling foreign-key references before
-	// committing (rows were copied with enforcement off).
-	rows, err := tx.QueryContext(ctx, "PRAGMA foreign_key_check;")
-	if err != nil {
-		return err
+	// committing (rows were copied with enforcement off). Only the tables it
+	// touched are checked: a stale row elsewhere is not this migration's to
+	// refuse, and would otherwise keep cmgr from starting.
+	for _, table := range []string{"instances", "portAssignments", "containers"} {
+		violation, err := firstForeignKeyViolation(ctx, tx, table)
+		if err != nil {
+			return err
+		}
+		if violation != "" {
+			return fmt.Errorf("foreign key check failed after rebuilding instances table: %s", violation)
+		}
 	}
+
+	return tx.Commit()
+}
+
+// firstForeignKeyViolation describes the first row of table whose foreign key
+// references a missing row, or returns "" when there is none.
+func firstForeignKeyViolation(ctx context.Context, tx *sql.Tx, table string) (string, error) {
+	rows, err := tx.QueryContext(ctx, "PRAGMA foreign_key_check("+table+");")
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
 	var violation string
 	if rows.Next() {
 		// foreign_key_check yields: table, rowid, parent (referenced table), fkid.
 		var (
-			table  string
+			child  string
 			rowid  sql.NullInt64
 			parent string
 			fkid   int
 		)
-		if err = rows.Scan(&table, &rowid, &parent, &fkid); err != nil {
-			rows.Close()
-			return err
+		if err = rows.Scan(&child, &rowid, &parent, &fkid); err != nil {
+			return "", err
 		}
 		rowidStr := "NULL"
 		if rowid.Valid {
 			rowidStr = strconv.FormatInt(rowid.Int64, 10)
 		}
-		violation = fmt.Sprintf("row %s in %q references a missing row in %q (fk %d)", rowidStr, table, parent, fkid)
+		violation = fmt.Sprintf("row %s in %q references a missing row in %q (fk %d)", rowidStr, child, parent, fkid)
 	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
-	if violation != "" {
-		return fmt.Errorf("foreign key check failed after rebuilding instances table: %s", violation)
-	}
-
-	return tx.Commit()
+	return violation, rows.Err()
 }
 
 func (m *Manager) getReversePortMap(id ChallengeId) (map[string]string, error) {

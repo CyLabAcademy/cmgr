@@ -518,7 +518,7 @@ func (m *Manager) freezeBaseImage(challenge ChallengeId, force bool) error {
 	m.log.debugf("creating base image %s", imageName)
 	resp, err := m.cli.ImageBuild(m.ctx, buildCtx, opts)
 	if err != nil {
-		m.log.errorf("failed to build base image: %s", err)
+		m.log.errorf("failed to build base image for %s: %s", cMeta.Id, err)
 		return err
 	}
 
@@ -526,13 +526,13 @@ func (m *Manager) freezeBaseImage(challenge ChallengeId, force bool) error {
 	messages, err := ioutil.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil {
-		m.log.errorf("failed to read build response from docker: %s", err)
+		m.log.errorf("failed to read build response from docker for %s: %s", cMeta.Id, err)
 		return err
 	}
 
 	// Search the response for an error message
 	if streamErr := dockerStreamError(messages); streamErr != nil {
-		err = fmt.Errorf("failed to build image: %s", streamErr)
+		err = fmt.Errorf("failed to build base image for %s: %s", cMeta.Id, streamErr)
 		m.log.error(err)
 		return err
 	}
@@ -640,19 +640,23 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 		m.log.debugf("creating image %s", imageName)
 		resp, err := m.cli.ImageBuild(m.ctx, buildCtx, opts)
 		if err != nil {
-			m.log.errorf("failed to build base image: %s", err)
+			m.log.errorf("failed to build base image for %s/%d: %s", cMeta.Id, bMeta.Id, err)
 			return err
 		}
 
 		messages, err := ioutil.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			m.log.errorf("failed to read build response from docker: %s", err)
+			m.log.errorf("failed to read build response from docker for %s/%d: %s", cMeta.Id, bMeta.Id, err)
 			return err
 		}
 
+		// Named, because docker's half of this failure says only which RUN
+		// step exited non-zero, the same sentence for every challenge of a
+		// type; without the ids, finding the failed ones means a re-run.
 		if streamErr := dockerStreamError(messages); streamErr != nil {
-			err = fmt.Errorf("failed to build image: %s", streamErr)
+			err = fmt.Errorf("failed to build image for %s (build %d, seed %d): %s",
+				cMeta.Id, bMeta.Id, bMeta.Seed, streamErr)
 			m.log.error(err)
 			return err
 		}
@@ -741,7 +745,7 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 			bMeta.stagedArtifacts = filepath.Join(m.artifactsDir, "."+bMeta.getArtifactsFilename()+".staged")
 			files, err = m.cacheArtifacts(cTar, bMeta.stagedArtifacts)
 			if err != nil {
-				m.log.errorf("could not cache artifacts: %s", err)
+				m.log.errorf("could not cache artifacts for %s (build %d, seed %d): %s", cMeta.Id, bMeta.Id, bMeta.Seed, err)
 				return err
 			}
 			for _, name := range files {

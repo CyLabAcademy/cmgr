@@ -153,6 +153,43 @@ func (b *BuildMetadata) getArtifactsFilename() string {
 	return fmt.Sprintf("%d.tar.gz", b.Id)
 }
 
+// promoteArtifacts serves the archive executeBuild staged, once the build row
+// that describes it is committed, or removes the previous one when the build
+// produced none. The rename is atomic: a download gets the old archive or the
+// new one, never a partial file.
+func (m *Manager) promoteArtifacts(build *BuildMetadata) error {
+	staged := build.stagedArtifacts
+	build.stagedArtifacts = ""
+	served := filepath.Join(m.artifactsDir, build.getArtifactsFilename())
+	if staged == "" {
+		if err := os.Remove(served); err != nil && !os.IsNotExist(err) {
+			err = fmt.Errorf("could not remove the artifact archive %s/%d no longer publishes: %w", build.Challenge, build.Id, err)
+			m.log.error(err)
+			return err
+		}
+		return nil
+	}
+	if err := os.Rename(staged, served); err != nil {
+		os.Remove(staged)
+		err = fmt.Errorf("could not promote the artifact archive of %s/%d: %w", build.Challenge, build.Id, err)
+		m.log.error(err)
+		return err
+	}
+	if directory, err := os.Open(m.artifactsDir); err == nil {
+		_ = directory.Sync()
+		_ = directory.Close()
+	}
+	return nil
+}
+
+// discardArtifacts drops a staged archive whose build was not recorded.
+func (m *Manager) discardArtifacts(build *BuildMetadata) {
+	if build.stagedArtifacts != "" {
+		os.Remove(build.stagedArtifacts)
+		build.stagedArtifacts = ""
+	}
+}
+
 func (i *InstanceMetadata) getNetworkName() string {
 	return fmt.Sprintf("cmgr-%d", i.Id)
 }
@@ -252,6 +289,10 @@ func (m *Manager) generateBuilds(builds []*BuildMetadata) error {
 
 		err = m.finalizeBuild(build)
 		if err != nil {
+			m.discardArtifacts(build)
+			return err
+		}
+		if err = m.promoteArtifacts(build); err != nil {
 			return err
 		}
 	}
@@ -477,7 +518,7 @@ func (m *Manager) freezeBaseImage(challenge ChallengeId, force bool) error {
 	m.log.debugf("creating base image %s", imageName)
 	resp, err := m.cli.ImageBuild(m.ctx, buildCtx, opts)
 	if err != nil {
-		m.log.errorf("failed to build base image: %s", err)
+		m.log.errorf("failed to build base image for %s: %s", cMeta.Id, err)
 		return err
 	}
 
@@ -485,13 +526,13 @@ func (m *Manager) freezeBaseImage(challenge ChallengeId, force bool) error {
 	messages, err := ioutil.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil {
-		m.log.errorf("failed to read build response from docker: %s", err)
+		m.log.errorf("failed to read build response from docker for %s: %s", cMeta.Id, err)
 		return err
 	}
 
 	// Search the response for an error message
 	if streamErr := dockerStreamError(messages); streamErr != nil {
-		err = fmt.Errorf("failed to build image: %s", streamErr)
+		err = fmt.Errorf("failed to build base image for %s: %s", cMeta.Id, streamErr)
 		m.log.error(err)
 		return err
 	}
@@ -522,7 +563,15 @@ func (m *Manager) freezeBaseImage(challenge ChallengeId, force bool) error {
 	return nil
 }
 
-func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, buildCtxFile string) error {
+// executeBuild leaves a validated artifact archive staged; the caller
+// promotes it once the build row is committed (promoteArtifacts).
+func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, buildCtxFile string) (retErr error) {
+	bMeta.stagedArtifacts = ""
+	defer func() {
+		if retErr != nil {
+			m.discardArtifacts(bMeta)
+		}
+	}()
 
 	seedStr := fmt.Sprintf("%d", bMeta.Seed)
 
@@ -591,19 +640,23 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 		m.log.debugf("creating image %s", imageName)
 		resp, err := m.cli.ImageBuild(m.ctx, buildCtx, opts)
 		if err != nil {
-			m.log.errorf("failed to build base image: %s", err)
+			m.log.errorf("failed to build base image for %s/%d: %s", cMeta.Id, bMeta.Id, err)
 			return err
 		}
 
 		messages, err := ioutil.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			m.log.errorf("failed to read build response from docker: %s", err)
+			m.log.errorf("failed to read build response from docker for %s/%d: %s", cMeta.Id, bMeta.Id, err)
 			return err
 		}
 
+		// Named, because docker's half of this failure says only which RUN
+		// step exited non-zero, the same sentence for every challenge of a
+		// type; without the ids, finding the failed ones means a re-run.
 		if streamErr := dockerStreamError(messages); streamErr != nil {
-			err = fmt.Errorf("failed to build image: %s", streamErr)
+			err = fmt.Errorf("failed to build image for %s (build %d, seed %d): %s",
+				cMeta.Id, bMeta.Id, bMeta.Seed, streamErr)
 			m.log.error(err)
 			return err
 		}
@@ -629,7 +682,7 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 
 	if m.hostOSType == "linux" {
 		m.log.debug("inserting custom seccomp profile")
-		hConfig.SecurityOpt = []string{"seccomp:" + seccompPolicy}
+		hConfig.SecurityOpt = []string{seccompSecurityOpt(seccompPolicy)}
 	}
 
 	respCC, err := m.cli.ContainerCreate(m.ctx, client.ContainerCreateOptions{
@@ -687,15 +740,12 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 
 			delete(lookups, "flag")
 		} else if hdr.Name == "challenge/artifacts.tar.gz" {
-			// cacheArtifacts writes atomically, but to the final build-ID path,
-			// so a rebuild replaces the prior archive here before the rest of the
-			// build is validated. Preserving the previous artifact across a failed
-			// rebuild requires staging the whole build and promoting on success,
-			// which is deferred to the staged-build work.
-			artifactsPath := filepath.Join(m.artifactsDir, bMeta.getArtifactsFilename())
-			files, err = m.cacheArtifacts(cTar, artifactsPath)
+			// Staged under a name no served "<id>.tar.gz" can match: the
+			// previous archive keeps serving until this build is recorded.
+			bMeta.stagedArtifacts = filepath.Join(m.artifactsDir, "."+bMeta.getArtifactsFilename()+".staged")
+			files, err = m.cacheArtifacts(cTar, bMeta.stagedArtifacts)
 			if err != nil {
-				m.log.errorf("could not cache artifacts: %s", err)
+				m.log.errorf("could not cache artifacts for %s (build %d, seed %d): %s", cMeta.Id, bMeta.Id, bMeta.Seed, err)
 				return err
 			}
 			for _, name := range files {
@@ -722,8 +772,6 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 
 	err = m.validateBuild(cMeta, bMeta, files)
 	if err != nil {
-		os.Remove(filepath.Join(m.artifactsDir, bMeta.getArtifactsFilename()))
-
 		// Free the build image now rather than waiting for the deferred
 		// container cleanup: while the extraction container exists it references
 		// the image, so the non-forced ImageRemove below could not untag it.
@@ -760,6 +808,17 @@ func (m *Manager) startNetwork(instance *InstanceMetadata, opts NetworkOptions) 
 	}
 	netname := instance.getNetworkName()
 	_, err := m.cli.NetworkCreate(m.ctx, netname, netSpec)
+	if errdefs.IsConflict(err) {
+		// A leftover of an earlier instance with this id: remove it and create
+		// again. One with endpoints still attached refuses removal.
+		m.log.warnf("stale challenge network %s already exists; removing it and retrying", netname)
+		_, rmErr := m.cli.NetworkRemove(m.ctx, netname, client.NetworkRemoveOptions{})
+		if rmErr != nil && !errdefs.IsNotFound(rmErr) {
+			err = fmt.Errorf("%w (stale network not removed: %w)", err, rmErr)
+		} else {
+			_, err = m.cli.NetworkCreate(m.ctx, netname, netSpec)
+		}
+	}
 	if err != nil {
 		m.log.errorf("could not create challenge network (%s): %s", netname, err)
 	}
@@ -780,14 +839,10 @@ func (m *Manager) stopNetwork(instance *InstanceMetadata) error {
 	return err
 }
 
-// portsAlreadyKnown reports whether every published port for an image already has
-// a non-zero host port reserved in ports, so the post-start read-back in
-// startContainers can be safely skipped. It is false when explicit ports are
-// disabled (portLow == 0, Docker assigns ephemeral ports) or when any required
-// port is unassigned — e.g. the rebuild flow, which clears instance.Ports before
-// restarting and so must read the bound port back. A port whose name is missing
-// from revPortMap is treated as unknown (false): without a resolvable name we
-// cannot confirm its reservation, and must not skip the read-back.
+// portsAlreadyKnown reports whether every published port for an image already
+// has a host port reserved in ports, so startContainers can skip reading the
+// bound ports back. Never without a port range, where Docker picks them, nor
+// for a port missing from revPortMap, whose reservation cannot be confirmed.
 func portsAlreadyKnown(portLow int, imagePorts []string, ports map[string]int, revPortMap map[string]string) bool {
 	if portLow == 0 {
 		return false
@@ -913,7 +968,7 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 			hConfig.ReadonlyRootfs = cOpts.ReadonlyRootfs
 			hConfig.CapDrop = (strslice.StrSlice)(cOpts.DroppedCaps)
 			if cOpts.NoNewPrivileges {
-				hConfig.SecurityOpt = append(hConfig.SecurityOpt, "no-new-privileges:true")
+				hConfig.SecurityOpt = append(hConfig.SecurityOpt, "no-new-privileges=true")
 			}
 			if cOpts.DiskQuota != "" {
 				_, quotas_enabled := os.LookupEnv(DISK_QUOTA_ENV)
@@ -947,7 +1002,7 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 			} else {
 				m.log.debug("inserting custom seccomp profile")
 			}
-			hConfig.SecurityOpt = append(hConfig.SecurityOpt, "seccomp:"+profile)
+			hConfig.SecurityOpt = append(hConfig.SecurityOpt, seccompSecurityOpt(profile))
 		}
 
 		nConfig := network.NetworkingConfig{

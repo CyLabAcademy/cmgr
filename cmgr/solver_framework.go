@@ -112,19 +112,19 @@ func (m *Manager) executeSolver(cMeta *ChallengeMetadata, bMeta *BuildMetadata, 
 	// Build the base image (will run the solver)
 	resp, err := m.cli.ImageBuild(m.ctx, solveCtx, opts)
 	if err != nil {
-		m.log.errorf("failed to build solver image: %s", err)
+		m.log.errorf("failed to build solver image for %s/%d: %s", cMeta.Id, bMeta.Id, err)
 		return err
 	}
 
 	messages, err := ioutil.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil {
-		m.log.errorf("failed to read build response from docker: %s", err)
+		m.log.errorf("failed to read solver build response from docker for %s/%d: %s", cMeta.Id, bMeta.Id, err)
 		return err
 	}
 
 	if streamErr := dockerStreamError(messages); streamErr != nil {
-		err = fmt.Errorf("failed to build image: %s", streamErr)
+		err = fmt.Errorf("failed to build solver image for %s (build %d): %s", cMeta.Id, bMeta.Id, streamErr)
 		m.log.error(err)
 		return err
 	}
@@ -143,7 +143,7 @@ func (m *Manager) executeSolver(cMeta *ChallengeMetadata, bMeta *BuildMetadata, 
 	hConfig := container.HostConfig{}
 	if m.hostOSType == "linux" {
 		m.log.debug("inserting custom seccomp profile")
-		hConfig.SecurityOpt = []string{"seccomp:" + seccompPolicy}
+		hConfig.SecurityOpt = []string{seccompSecurityOpt(seccompPolicy)}
 	}
 
 	// With no instance network (non-service builds) the solver runs on Docker's

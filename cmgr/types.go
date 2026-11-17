@@ -226,6 +226,9 @@ type BuildMetadata struct {
 
 	Schema        string `json:"schema"`
 	InstanceCount int    `json:"instance_count"`
+
+	// stagedArtifacts is a validated archive awaiting promoteArtifacts.
+	stagedArtifacts string
 }
 
 type ImageId int64

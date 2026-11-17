@@ -126,12 +126,17 @@ func (m *Manager) loadMarkdownChallenge(path string, info os.FileInfo) (*Challen
 			continue
 		}
 
+		// Text that is not a '- key: value' line, or a value that does not
+		// parse, fails the load rather than leaving a field at its zero value.
+		// An unknown key is ignored, so that a problem.md written for a newer
+		// loader (cork's difficulty, say) still loads.
 		if match == nil {
-			err = fmt.Errorf("unrecognized metadata text on line %d: %s", idx, path)
+			err = fmt.Errorf("unrecognized metadata text on line %d (header lines are '- key: value'): %s", idx, path)
 			m.log.error(err)
-			continue
+			return nil, err
 		}
 
+		var valueErr error
 		switch strings.ToLower(match[1]) {
 		case "id":
 			md.Id = ChallengeId(match[2])
@@ -142,30 +147,33 @@ func (m *Manager) loadMarkdownChallenge(path string, info os.FileInfo) (*Challen
 		case "category":
 			md.Category = match[2]
 		case "templatable":
-			val, tmpErr := parseBool(match[2])
-			md.Templatable = val
-			err = tmpErr
+			md.Templatable, valueErr = parseBool(match[2])
 		case "points":
-			i, tmpErr := strconv.Atoi(match[2])
-			md.Points = i
-			err = tmpErr
+			md.Points, valueErr = strconv.Atoi(match[2])
 		case "maxusers":
-			i, tmpErr := strconv.Atoi(match[2])
-			md.MaxUsers = i
-			err = tmpErr
+			md.MaxUsers, valueErr = strconv.Atoi(match[2])
 		default:
-			err = fmt.Errorf("unrecognized top-level attribute '%s' on line %d: %s", match[1], idx, path)
+			m.log.warnf("ignoring unrecognized top-level attribute '%s' on line %d: %s", match[1], idx, path)
+		}
+		if valueErr != nil {
+			err = fmt.Errorf("invalid value for '%s' on line %d: %w: %s", match[1], idx, valueErr, path)
 			m.log.error(err)
+			return nil, err
 		}
 	}
 
+	// A section error fails the load: swallowed, a bad "challenge options"
+	// block would deploy the challenge without its hardening.
+	var sectionErr error
 	section := ""
 	startIdx := 0
 	for idx < len(lines) {
 		line = strings.TrimSpace(lines[idx])
 		match := sectionRe.FindStringSubmatch(line)
 		if match != nil && section != "" {
-			err = m.processMarkdownSection(md, section, lines, startIdx, idx)
+			if tmpErr := m.processMarkdownSection(md, section, lines, startIdx, idx); tmpErr != nil && sectionErr == nil {
+				sectionErr = tmpErr
+			}
 		}
 		if match != nil {
 			section = match[1]
@@ -175,7 +183,13 @@ func (m *Manager) loadMarkdownChallenge(path string, info os.FileInfo) (*Challen
 	}
 
 	if section != "" {
-		err = m.processMarkdownSection(md, section, lines, startIdx, idx)
+		if tmpErr := m.processMarkdownSection(md, section, lines, startIdx, idx); tmpErr != nil && sectionErr == nil {
+			sectionErr = tmpErr
+		}
+	}
+
+	if sectionErr != nil {
+		return nil, sectionErr
 	}
 
 	h := crc32.NewIEEE()
@@ -240,41 +254,46 @@ func (m *Manager) processMarkdownSection(md *ChallengeMetadata, section string, 
 	case "challenge options":
 		yamlStart := 0
 		yamlEnd := 0
-		for i := startIdx; i < endIdx; i++ {
-			if lines[i] == "```yaml" {
+		// Markers are matched trimmed, so CRLF files and trailing spaces work.
+		// Any marker problem is returned rather than parsed past: parsing the
+		// wrong range would load the challenge without its options.
+		for i := startIdx; i < endIdx && err == nil; i++ {
+			switch strings.TrimSpace(lines[i]) {
+			case "```yaml":
 				if yamlStart != 0 {
-					err = fmt.Errorf("found multiple start markers for yaml at lines %d and %d", yamlStart-1, i)
-					m.log.error(err)
+					err = fmt.Errorf("found multiple start markers for yaml at lines %d and %d: %s", yamlStart, i+1, md.Path)
 				}
 				yamlStart = i + 1
-			} else if lines[i] == "```" {
+			case "```":
 				if yamlEnd != 0 {
-					err = fmt.Errorf("found multiple end markers for yaml at lines %d and %d", yamlEnd, i)
-					m.log.error(err)
+					err = fmt.Errorf("found multiple end markers for yaml at lines %d and %d: %s", yamlEnd+1, i+1, md.Path)
 				}
 				yamlEnd = i
 			}
 		}
 
-		if yamlStart == 0 && yamlEnd == 0 {
-			m.log.debug("addining implicit delimiters for challenge options")
-			yamlStart = startIdx
-			yamlEnd = endIdx
-		} else if (yamlStart == 0) != (yamlEnd == 0) {
-			err = fmt.Errorf("found a start/end marker but missing its pair: startline=%d endline=%d", yamlStart, yamlEnd)
-			m.log.error(err)
-			yamlStart = 0
-			yamlEnd = 0
+		if err == nil {
+			if yamlStart == 0 && yamlEnd == 0 {
+				m.log.debug("adding implicit delimiters for challenge options")
+				yamlStart = startIdx
+				yamlEnd = endIdx
+			} else if yamlStart == 0 || yamlEnd == 0 || yamlEnd < yamlStart {
+				err = fmt.Errorf("challenge options need one ```yaml line and one ``` line after it: %s", md.Path)
+			}
 		}
 
-		opts := ChallengeOptions{}
-		yamlData := []byte(strings.Join(lines[yamlStart:yamlEnd], "\n"))
-		err = yaml.Unmarshal(yamlData, &opts)
+		if err == nil {
+			opts := ChallengeOptions{}
+			yamlData := []byte(strings.Join(lines[yamlStart:yamlEnd], "\n"))
+			if err = yaml.Unmarshal(yamlData, &opts); err != nil {
+				err = fmt.Errorf("could not parse challenge options: %w: %s", err, md.Path)
+			} else {
+				md.ChallengeOptions = opts
+			}
+		}
 		if err != nil {
 			m.log.error(err)
 		}
-
-		md.ChallengeOptions = opts
 
 	default:
 		attrVal := strings.TrimSpace(strings.Join(lines[startIdx:endIdx], "\n"))

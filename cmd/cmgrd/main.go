@@ -370,8 +370,17 @@ func (s state) artifactsHandler(w http.ResponseWriter, r *http.Request) {
 
 	build := cmgr.BuildId(buildInt)
 	meta, err := s.mgr.GetBuildMetadata(build)
-	_, ok := err.(*cmgr.UnknownIdentifierError)
-	if ok || (err != nil && !meta.HasArtifacts) {
+	if _, ok := err.(*cmgr.UnknownIdentifierError); ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	} else if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(err.Error()))
+		return
+	}
+	// A build that published nothing has no archive to serve, whatever a
+	// file of its name holds.
+	if !meta.HasArtifacts {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}

@@ -3,6 +3,8 @@ package cmgr
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -1711,6 +1713,235 @@ func TestRebuildInstancesTableMigration(t *testing.T) {
 	}
 }
 
+// instancesDeclaration returns the CREATE TABLE text SQLite keeps for the
+// instances table.
+func instancesDeclaration(t *testing.T, db *sqlx.DB) string {
+	t.Helper()
+	var decl string
+	if err := db.Get(&decl, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'instances';"); err != nil {
+		t.Fatalf("read instances declaration: %s", err)
+	}
+	return decl
+}
+
+// A database from before ids stopped being reused has every current column
+// but no AUTOINCREMENT. The rebuild must add it, keep every row and what
+// references it, and continue the numbering, so that the id of a deleted
+// instance is never handed out again.
+func TestRebuildInstancesTableAddsAutoincrement(t *testing.T) {
+	dbFile, err := os.CreateTemp("", "cmgr-autoinc-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %s", err)
+	}
+	dbFile.Close()
+	t.Cleanup(func() { removeDBFiles(dbFile.Name()) })
+	db, err := sqlx.Open("sqlite3", dbFile.Name()+"?_fk=true&_journal_mode=WAL&_busy_timeout=50&_synchronous=NORMAL")
+	if err != nil {
+		t.Fatalf("failed to open db: %s", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	const schema = `
+	CREATE TABLE builds (id INTEGER PRIMARY KEY);
+	CREATE TABLE instances (
+		id INTEGER PRIMARY KEY,
+		lastsolved INTEGER,
+		build INTEGER NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		is_finalized INTEGER NOT NULL DEFAULT 0 CHECK(is_finalized IN (0,1)),
+		FOREIGN KEY (build) REFERENCES builds (id) ON UPDATE RESTRICT ON DELETE RESTRICT
+	);
+	CREATE TABLE portAssignments (
+		instance INTEGER NOT NULL,
+		name TEXT NOT NULL,
+		port INTEGER NOT NULL,
+		FOREIGN KEY (instance) REFERENCES instances (id) ON UPDATE RESTRICT ON DELETE CASCADE
+	);
+	CREATE TABLE containers (
+		instance INTEGER NOT NULL,
+		id TEXT NOT NULL PRIMARY KEY,
+		FOREIGN KEY (instance) REFERENCES instances (id) ON UPDATE RESTRICT ON DELETE CASCADE
+	);
+	INSERT INTO builds(id) VALUES (1);
+	INSERT INTO instances(id, lastsolved, build) VALUES (1, 0, 1);
+	INSERT INTO instances(id, lastsolved, build) VALUES (5, 0, 1);
+	INSERT INTO portAssignments(instance, name, port) VALUES (1, 'challenge', 12345);
+	INSERT INTO containers(instance, id) VALUES (1, 'deadbeefcafe');`
+	if _, err := db.Exec(schema); err != nil {
+		t.Fatalf("failed to create the pre-AUTOINCREMENT schema: %s", err)
+	}
+	if strings.Contains(strings.ToUpper(instancesDeclaration(t, db)), "AUTOINCREMENT") {
+		t.Fatal("fixture already has AUTOINCREMENT")
+	}
+
+	if err := rebuildInstancesTable(db, true, true); err != nil {
+		t.Fatalf("rebuildInstancesTable failed: %s", err)
+	}
+	if !strings.Contains(strings.ToUpper(instancesDeclaration(t, db)), "AUTOINCREMENT") {
+		t.Fatal("instances still lacks AUTOINCREMENT after the rebuild")
+	}
+
+	for _, check := range []struct {
+		what, query string
+		want        int
+	}{
+		{"instances", "SELECT COUNT(*) FROM instances;", 2},
+		{"portAssignment", "SELECT COUNT(*) FROM portAssignments WHERE instance = 1;", 1},
+		{"container", "SELECT COUNT(*) FROM containers WHERE instance = 1;", 1},
+	} {
+		var n int
+		if err := db.Get(&n, check.query); err != nil {
+			t.Fatalf("%s count: %s", check.what, err)
+		}
+		if n != check.want {
+			t.Errorf("%s rows after the rebuild = %d, want %d", check.what, n, check.want)
+		}
+	}
+
+	// The numbering continues past the largest id copied, and the id of a
+	// deleted instance is not handed out again.
+	if _, err := db.Exec("DELETE FROM instances WHERE id = 5;"); err != nil {
+		t.Fatalf("delete instance 5: %s", err)
+	}
+	res, err := db.Exec("INSERT INTO instances(lastsolved, build) VALUES (0, 1);")
+	if err != nil {
+		t.Fatalf("insert after the rebuild: %s", err)
+	}
+	if id, _ := res.LastInsertId(); id != 6 {
+		t.Fatalf("the instance after the rebuild got id %d, want 6 (5 was deleted and must not come back)", id)
+	}
+	if _, err := db.Exec("DELETE FROM instances WHERE id = 6;"); err != nil {
+		t.Fatalf("delete instance 6: %s", err)
+	}
+	res, err = db.Exec("INSERT INTO instances(lastsolved, build) VALUES (0, 1);")
+	if err != nil {
+		t.Fatalf("second insert after the rebuild: %s", err)
+	}
+	if id, _ := res.LastInsertId(); id != 7 {
+		t.Fatalf("the next instance got id %d, want 7", id)
+	}
+}
+
+// initDatabase detects a table declared without AUTOINCREMENT and rebuilds
+// it; a fresh database gets it from the schema; a second run changes nothing.
+func TestInitDatabaseAddsAutoincrement(t *testing.T) {
+	dbFile, err := os.CreateTemp("", "cmgr-autoinc-init-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %s", err)
+	}
+	dbFile.Close()
+	t.Cleanup(func() { removeDBFiles(dbFile.Name()) })
+	t.Setenv(DB_ENV, dbFile.Name())
+
+	old := strings.Replace(schemaQuery, "id INTEGER PRIMARY KEY AUTOINCREMENT,", "id INTEGER PRIMARY KEY,", 1)
+	if old == schemaQuery {
+		t.Fatal("schemaQuery does not declare instances.id with AUTOINCREMENT")
+	}
+	db, err := sqlx.Open("sqlite3", dbFile.Name()+"?_fk=true")
+	if err != nil {
+		t.Fatalf("failed to open db: %s", err)
+	}
+	if _, err := db.Exec(old); err != nil {
+		t.Fatalf("failed to create the old schema: %s", err)
+	}
+	db.Close()
+
+	for run := 1; run <= 2; run++ {
+		m := &Manager{log: newLogger(DISABLED)}
+		if err := m.initDatabase(); err != nil {
+			t.Fatalf("initDatabase run %d: %s", run, err)
+		}
+		decl := instancesDeclaration(t, m.db)
+		m.db.Close()
+		if !strings.Contains(strings.ToUpper(decl), "AUTOINCREMENT") {
+			t.Fatalf("run %d: instances lacks AUTOINCREMENT: %s", run, decl)
+		}
+	}
+
+	fresh := &Manager{log: newLogger(DISABLED)}
+	t.Setenv(DB_ENV, filepath.Join(t.TempDir(), "fresh.db"))
+	if err := fresh.initDatabase(); err != nil {
+		t.Fatalf("initDatabase on a fresh database: %s", err)
+	}
+	defer fresh.db.Close()
+	if !strings.Contains(strings.ToUpper(instancesDeclaration(t, fresh.db)), "AUTOINCREMENT") {
+		t.Fatal("a fresh database lacks AUTOINCREMENT on instances")
+	}
+}
+
+// openRebuildFixture opens a scratch database holding schema.
+func openRebuildFixture(t *testing.T, schema string) *sqlx.DB {
+	t.Helper()
+	db, err := sqlx.Open("sqlite3", filepath.Join(t.TempDir(), "rebuild.db")+"?_fk=true")
+	if err != nil {
+		t.Fatalf("failed to open db: %s", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if _, err := db.Exec(schema); err != nil {
+		t.Fatalf("failed to create the fixture: %s", err)
+	}
+	return db
+}
+
+const rebuildFixtureTables = `
+	CREATE TABLE builds (id INTEGER PRIMARY KEY);
+	CREATE TABLE portAssignments (instance INTEGER NOT NULL, name TEXT NOT NULL, port INTEGER NOT NULL,
+		FOREIGN KEY (instance) REFERENCES instances (id) ON UPDATE RESTRICT ON DELETE CASCADE);
+	CREATE TABLE containers (instance INTEGER NOT NULL, id TEXT NOT NULL PRIMARY KEY,
+		FOREIGN KEY (instance) REFERENCES instances (id) ON UPDATE RESTRICT ON DELETE CASCADE);
+	INSERT INTO builds(id) VALUES (1);`
+
+// Rebuilding a table that already has AUTOINCREMENT must keep its high-water
+// mark: the newest instance deleted before the rebuild keeps its id retired.
+func TestRebuildInstancesTableKeepsTheHighWaterMark(t *testing.T) {
+	db := openRebuildFixture(t, rebuildFixtureTables+`
+	CREATE TABLE instances (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		lastsolved INTEGER,
+		build INTEGER NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		is_finalized INTEGER NOT NULL DEFAULT 0 CHECK(is_finalized IN (0,1)),
+		FOREIGN KEY (build) REFERENCES builds (id) ON UPDATE RESTRICT ON DELETE RESTRICT
+	);
+	INSERT INTO instances(lastsolved, build) VALUES (0, 1), (0, 1), (0, 1);
+	DELETE FROM instances WHERE id = 3;`)
+
+	if err := rebuildInstancesTable(db, true, true); err != nil {
+		t.Fatalf("rebuildInstancesTable failed: %s", err)
+	}
+	res, err := db.Exec("INSERT INTO instances(lastsolved, build) VALUES (0, 1);")
+	if err != nil {
+		t.Fatalf("insert after the rebuild: %s", err)
+	}
+	if id, _ := res.LastInsertId(); id != 4 {
+		t.Fatalf("the instance after the rebuild got id %d, want 4 (3 was handed out before)", id)
+	}
+}
+
+// The migration checks only the tables it rebuilt: a stale foreign key
+// elsewhere is not its to refuse, and refusing it would keep cmgr from starting.
+func TestRebuildInstancesTableIgnoresUnrelatedForeignKeys(t *testing.T) {
+	db := openRebuildFixture(t, rebuildFixtureTables+`
+	CREATE TABLE instances (
+		id INTEGER PRIMARY KEY,
+		lastsolved INTEGER,
+		build INTEGER NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		is_finalized INTEGER NOT NULL DEFAULT 0 CHECK(is_finalized IN (0,1)),
+		FOREIGN KEY (build) REFERENCES builds (id) ON UPDATE RESTRICT ON DELETE RESTRICT
+	);
+	CREATE TABLE lookupData (build INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+		FOREIGN KEY (build) REFERENCES builds (id) ON UPDATE RESTRICT ON DELETE CASCADE);
+	PRAGMA foreign_keys = OFF;
+	INSERT INTO lookupData(build, key, value) VALUES (99, 'stale', 'row');
+	PRAGMA foreign_keys = ON;
+	INSERT INTO instances(id, lastsolved, build) VALUES (1, 0, 1);`)
+
+	if err := rebuildInstancesTable(db, true, true); err != nil {
+		t.Fatalf("a stale row in an unrelated table failed the migration: %s", err)
+	}
+}
+
 // TestInitDatabaseRepairsStaleIsFinalizedDefault drives initDatabase against a
 // database in the buggy intermediate state: created_at and is_finalized both
 // exist, but is_finalized was added by the old ALTER ... DEFAULT 1 migration.
@@ -1792,5 +2023,239 @@ func TestInitDatabaseRepairsStaleIsFinalizedDefault(t *testing.T) {
 	}
 	if fresh != 0 {
 		t.Errorf("expected new instance to default to is_finalized=0, got %d", fresh)
+	}
+}
+
+// TestLookupChallengeMetadataSurfacesOptionsDecodeError verifies that a
+// containerOptions row that fails to decode (e.g. a corrupt seccomp column)
+// causes lookupChallengeMetadata to return an error instead of silently
+// returning the challenge with no container options — which would launch
+// instances without any of their declared hardening.
+func TestLookupChallengeMetadataSurfacesOptionsDecodeError(t *testing.T) {
+	mgr := setupTestManager(t)
+	defer mgr.db.Close()
+
+	challenge := &ChallengeMetadata{
+		Id:            "test/corrupt-options",
+		Name:          "Corrupt Options",
+		Namespace:     "test",
+		ChallengeType: "custom",
+		Hosts:         []HostInfo{{Name: "challenge", Target: ""}},
+		PortMap:       map[string]PortInfo{},
+		Path:          "/tmp/test/problem.md",
+		ChallengeOptions: ChallengeOptions{
+			Overrides: map[string]ContainerOptions{
+				"": {ReadonlyRootfs: true},
+			},
+		},
+	}
+
+	if errs := mgr.addChallenges([]*ChallengeMetadata{challenge}); len(errs) > 0 {
+		t.Fatalf("addChallenges failed: %v", errs)
+	}
+
+	if _, err := mgr.db.Exec("UPDATE containerOptions SET seccomp='{not json' WHERE challenge=?", challenge.Id); err != nil {
+		t.Fatalf("failed to corrupt seccomp column: %s", err)
+	}
+
+	if _, err := mgr.lookupChallengeMetadata(challenge.Id); err == nil {
+		t.Fatal("expected lookupChallengeMetadata to fail on a corrupt seccomp column, got nil error")
+	}
+}
+
+// A failed child-row insert used to roll the transaction back and then carry
+// on with a nil err: later statements ran on the dead transaction, the real
+// error was lost, and the batch was abandoned at the next rollback.
+func TestWriteChallengesReportsTheFailureAndContinues(t *testing.T) {
+	newChallenge := func(id ChallengeId, tag string) *ChallengeMetadata {
+		return &ChallengeMetadata{
+			Id: id, Name: string(id), Namespace: "test", ChallengeType: "custom", Path: "/t/" + string(id),
+			Tags:             []string{tag},
+			Hints:            []string{"a hint"},
+			Hosts:            []HostInfo{{Name: "challenge"}},
+			PortMap:          map[string]PortInfo{},
+			ChallengeOptions: ChallengeOptions{Overrides: map[string]ContainerOptions{"": {ReadonlyRootfs: true}}},
+		}
+	}
+	for _, path := range []string{"add", "update"} {
+		t.Run(path, func(t *testing.T) {
+			mgr := setupTestManager(t)
+			defer mgr.db.Close()
+			bad, good := newChallenge("test/bad", "fine"), newChallenge("test/good", "fine")
+			if path == "update" {
+				if errs := mgr.addChallenges([]*ChallengeMetadata{bad, good}); len(errs) > 0 {
+					t.Fatalf("seeding failed: %v", errs)
+				}
+			}
+			if _, err := mgr.db.Exec(`CREATE TRIGGER reject_boom BEFORE INSERT ON tags WHEN NEW.tag = 'boom'
+				BEGIN SELECT RAISE(ABORT, 'tag rejected'); END;`); err != nil {
+				t.Fatalf("create trigger: %s", err)
+			}
+			bad.Tags = []string{"boom"}
+			good.Tags = []string{"changed"}
+
+			var errs []error
+			if path == "add" {
+				errs = mgr.addChallenges([]*ChallengeMetadata{bad, good})
+			} else {
+				errs = mgr.updateChallenges([]*ChallengeMetadata{bad, good}, false, false)
+			}
+			if len(errs) != 1 || !strings.Contains(errs[0].Error(), "tag rejected") {
+				t.Fatalf("errors = %v; want exactly the rejected tag", errs)
+			}
+			got, err := mgr.lookupChallengeMetadata(good.Id)
+			if err != nil || len(got.Tags) != 1 || got.Tags[0] != "changed" {
+				t.Fatalf("the next challenge was not written: %v, %v", got, err)
+			}
+			kept, err := mgr.lookupChallengeMetadata(bad.Id)
+			switch path {
+			case "add":
+				if err == nil {
+					t.Fatalf("the failed challenge was recorded: %+v", kept)
+				}
+			case "update":
+				if err != nil || len(kept.Tags) != 1 || kept.Tags[0] != "fine" || len(kept.Hints) != 1 {
+					t.Fatalf("the failed update was not rolled back: %+v, %v", kept, err)
+				}
+			}
+		})
+	}
+}
+
+// TestReassignPortsKeepsAddressAcrossRestart covers the rebuild path with a
+// port range configured: after stopContainers released an instance's ports,
+// reassignPorts must claim them again (the same numbers while free, a fresh
+// one from the range otherwise) and persist them, so the restarted containers
+// bind inside CMGR_PORTS and the API keeps reporting the port.
+func TestReassignPortsKeepsAddressAcrossRestart(t *testing.T) {
+	mgr := setupTestManager(t)
+	defer mgr.db.Close()
+	mgr.portLow = 30000
+	mgr.portHigh = 30010
+
+	challenge := &ChallengeMetadata{
+		Id: "test/restart", Name: "Restart", Namespace: "t", ChallengeType: "custom", Description: "d", Path: "/t/p",
+		Hosts:            []HostInfo{{Name: "challenge"}},
+		PortMap:          map[string]PortInfo{"http": {Host: "challenge", Port: 8000}},
+		ChallengeOptions: ChallengeOptions{Overrides: map[string]ContainerOptions{"": {}}},
+	}
+	if errs := mgr.addChallenges([]*ChallengeMetadata{challenge}); len(errs) > 0 {
+		t.Fatalf("failed to add challenge: %v", errs)
+	}
+	build := &BuildMetadata{Seed: 1, Format: "flag{%s}", Challenge: challenge.Id, Schema: "s", InstanceCount: 1}
+	if err := mgr.openBuild(build); err != nil {
+		t.Fatalf("failed to open build: %v", err)
+	}
+	build.Images = []Image{{Host: "challenge", Ports: []string{"8000/tcp"}}}
+	revPortMap := map[string]string{"8000/tcp": "http"}
+
+	instance := &InstanceMetadata{Build: build.Id, Ports: map[string]int{}}
+	if err := mgr.openInstance(instance); err != nil {
+		t.Fatalf("failed to open instance: %v", err)
+	}
+	port, err := mgr.reservePort(instance.Id, "http")
+	if err != nil {
+		t.Fatalf("failed to reserve the initial port: %v", err)
+	}
+	instance.Ports["http"] = port
+
+	// The rebuild path: containers (and with them the port rows) go away,
+	// then the instance is restarted in place.
+	previous := instance.Ports
+	if err := mgr.removeContainersMetadata(instance); err != nil {
+		t.Fatalf("failed to release container metadata: %v", err)
+	}
+	if len(instance.Ports) != 0 {
+		t.Fatalf("expected the ports to be released, got %v", instance.Ports)
+	}
+	if err := mgr.reassignPorts(build, instance, revPortMap, previous); err != nil {
+		t.Fatalf("reassignPorts failed: %v", err)
+	}
+	if instance.Ports["http"] != port {
+		t.Errorf("expected the instance to keep port %d, got %d", port, instance.Ports["http"])
+	}
+	stored, err := mgr.lookupInstanceMetadata(instance.Id)
+	if err != nil {
+		t.Fatalf("failed to look up the instance: %v", err)
+	}
+	if stored.Ports["http"] != port {
+		t.Errorf("expected the reassigned port %d to be persisted, got %v", port, stored.Ports)
+	}
+
+	// If another launch grabbed the number meanwhile, a fresh one from the
+	// range is assigned instead of failing or colliding.
+	if err := mgr.removeContainersMetadata(instance); err != nil {
+		t.Fatalf("failed to release container metadata: %v", err)
+	}
+	other := &InstanceMetadata{Build: build.Id, Ports: map[string]int{}}
+	if err := mgr.openInstance(other); err != nil {
+		t.Fatalf("failed to open the competing instance: %v", err)
+	}
+	if claimed, err := mgr.claimPort(other.Id, "http", port); err != nil || !claimed {
+		t.Fatalf("competing instance could not take port %d: claimed=%v err=%v", port, claimed, err)
+	}
+	if err := mgr.reassignPorts(build, instance, revPortMap, previous); err != nil {
+		t.Fatalf("reassignPorts after a collision failed: %v", err)
+	}
+	got := instance.Ports["http"]
+	if got == port || got < mgr.portLow || got > mgr.portHigh {
+		t.Errorf("expected a different port inside %d-%d, got %d", mgr.portLow, mgr.portHigh, got)
+	}
+
+	rowsFor := func(id InstanceId) int {
+		var n int
+		if err := mgr.db.Get(&n, "SELECT COUNT(*) FROM portAssignments WHERE instance = ?", id); err != nil {
+			t.Fatalf("failed to count port assignments: %v", err)
+		}
+		return n
+	}
+
+	// A previous port outside the current range (an instance from before
+	// CMGR_PORTS was set) is not reclaimed; a fresh one from the range is.
+	if err := mgr.removeContainersMetadata(instance); err != nil {
+		t.Fatalf("failed to release container metadata: %v", err)
+	}
+	if err := mgr.reassignPorts(build, instance, revPortMap, map[string]int{"http": 45000}); err != nil {
+		t.Fatalf("reassignPorts with an out-of-range previous port failed: %v", err)
+	}
+	if got := instance.Ports["http"]; got < mgr.portLow || got > mgr.portHigh {
+		t.Errorf("expected a port inside %d-%d, got %d", mgr.portLow, mgr.portHigh, got)
+	}
+
+	// A published port with no name in the reverse map is an error, and
+	// nothing is left reserved under an empty name.
+	if err := mgr.removeContainersMetadata(instance); err != nil {
+		t.Fatalf("failed to release container metadata: %v", err)
+	}
+	if err := mgr.reassignPorts(build, instance, map[string]string{}, previous); err == nil {
+		t.Errorf("expected an error for a port missing from the reverse map")
+	}
+	if n := rowsFor(instance.Id); n != 0 {
+		t.Errorf("expected no port assignments after the failed reassignment, found %d", n)
+	}
+
+	// A failure part-way through (here: the range is exhausted after the
+	// first port) releases the ports already reserved for the instance.
+	twoPorts := &BuildMetadata{Id: build.Id, Images: []Image{{Host: "challenge", Ports: []string{"8000/tcp", "8001/tcp"}}}}
+	twoNames := map[string]string{"8000/tcp": "http", "8001/tcp": "ssh"}
+	mgr.portLow, mgr.portHigh = 31000, 31000
+	if err := mgr.reassignPorts(twoPorts, instance, twoNames, nil); err == nil {
+		t.Errorf("expected an error when the range cannot hold both ports")
+	}
+	if n := rowsFor(instance.Id); n != 0 {
+		t.Errorf("expected the partial reservation to be rolled back, found %d assignment(s)", n)
+	}
+	if len(instance.Ports) != 0 {
+		t.Errorf("expected instance.Ports to be cleared after the rollback, got %v", instance.Ports)
+	}
+
+	// Without a port range nothing is reserved: docker picks and the
+	// read-back records it.
+	mgr.portLow = 0
+	if err := mgr.reassignPorts(build, instance, revPortMap, previous); err != nil {
+		t.Fatalf("reassignPorts without a port range failed: %v", err)
+	}
+	if n := rowsFor(instance.Id); n != 0 {
+		t.Errorf("expected no reservation without a port range, found %d", n)
 	}
 }

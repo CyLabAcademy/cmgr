@@ -1,0 +1,6 @@
+name: dyn
+flag_format: dyn{%s}
+challenges:
+  lifecycle/web:
+    seeds: [2]
+    instance_count: -1

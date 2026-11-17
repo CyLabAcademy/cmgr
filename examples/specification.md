@@ -157,7 +157,7 @@ containers.
   [prevent](https://www.kernel.org/doc/html/latest/userspace-api/no_new_privs.html) processes inside
   the container from gaining additional privileges via `execve()` calls (by exploiting setuid
   binaries, etc). This is equivalent to passing the
-  [`--security-opt="no-new-privileges:true"`](https://docs.docker.com/engine/reference/run/#security-configuration)
+  [`--security-opt="no-new-privileges=true"`](https://docs.docker.com/engine/reference/run/#security-configuration)
   option to `docker run`. Specify a boolean value, as shown in the example below. Defaults to
   `false`.
 

@@ -75,3 +75,8 @@ jobs:
     # (BuildKit cache starts empty) vs the master baseline without the flag.
     - name: Integration Tests
       run: CMGR_DIR=examples CMGR_ARTIFACT_DIR=artifacts bin/cmgr test --require-solve --keep-images examples
+
+    # Rebuilds, relaunches and their failure paths, which the step above never
+    # reaches: it builds, solves and destroys each example once.
+    - name: Lifecycle Tests
+      run: bash ci/lifecycle/lifecycle.sh bin/cmgr

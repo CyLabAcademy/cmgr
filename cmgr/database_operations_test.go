@@ -3,6 +3,7 @@ package cmgr
 import (
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -1829,5 +1830,64 @@ func TestLookupChallengeMetadataSurfacesOptionsDecodeError(t *testing.T) {
 
 	if _, err := mgr.lookupChallengeMetadata(challenge.Id); err == nil {
 		t.Fatal("expected lookupChallengeMetadata to fail on a corrupt seccomp column, got nil error")
+	}
+}
+
+// A failed child-row insert used to roll the transaction back and then carry
+// on with a nil err: later statements ran on the dead transaction, the real
+// error was lost, and the batch was abandoned at the next rollback.
+func TestWriteChallengesReportsTheFailureAndContinues(t *testing.T) {
+	newChallenge := func(id ChallengeId, tag string) *ChallengeMetadata {
+		return &ChallengeMetadata{
+			Id: id, Name: string(id), Namespace: "test", ChallengeType: "custom", Path: "/t/" + string(id),
+			Tags:             []string{tag},
+			Hints:            []string{"a hint"},
+			Hosts:            []HostInfo{{Name: "challenge"}},
+			PortMap:          map[string]PortInfo{},
+			ChallengeOptions: ChallengeOptions{Overrides: map[string]ContainerOptions{"": {ReadonlyRootfs: true}}},
+		}
+	}
+	for _, path := range []string{"add", "update"} {
+		t.Run(path, func(t *testing.T) {
+			mgr := setupTestManager(t)
+			defer mgr.db.Close()
+			bad, good := newChallenge("test/bad", "fine"), newChallenge("test/good", "fine")
+			if path == "update" {
+				if errs := mgr.addChallenges([]*ChallengeMetadata{bad, good}); len(errs) > 0 {
+					t.Fatalf("seeding failed: %v", errs)
+				}
+			}
+			if _, err := mgr.db.Exec(`CREATE TRIGGER reject_boom BEFORE INSERT ON tags WHEN NEW.tag = 'boom'
+				BEGIN SELECT RAISE(ABORT, 'tag rejected'); END;`); err != nil {
+				t.Fatalf("create trigger: %s", err)
+			}
+			bad.Tags = []string{"boom"}
+			good.Tags = []string{"changed"}
+
+			var errs []error
+			if path == "add" {
+				errs = mgr.addChallenges([]*ChallengeMetadata{bad, good})
+			} else {
+				errs = mgr.updateChallenges([]*ChallengeMetadata{bad, good}, false, false)
+			}
+			if len(errs) != 1 || !strings.Contains(errs[0].Error(), "tag rejected") {
+				t.Fatalf("errors = %v; want exactly the rejected tag", errs)
+			}
+			got, err := mgr.lookupChallengeMetadata(good.Id)
+			if err != nil || len(got.Tags) != 1 || got.Tags[0] != "changed" {
+				t.Fatalf("the next challenge was not written: %v, %v", got, err)
+			}
+			kept, err := mgr.lookupChallengeMetadata(bad.Id)
+			switch path {
+			case "add":
+				if err == nil {
+					t.Fatalf("the failed challenge was recorded: %+v", kept)
+				}
+			case "update":
+				if err != nil || len(kept.Tags) != 1 || kept.Tags[0] != "fine" || len(kept.Hints) != 1 {
+					t.Fatalf("the failed update was not rolled back: %+v, %v", kept, err)
+				}
+			}
+		})
 	}
 }

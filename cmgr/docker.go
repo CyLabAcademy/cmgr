@@ -804,6 +804,17 @@ func (m *Manager) startNetwork(instance *InstanceMetadata, opts NetworkOptions) 
 	}
 	netname := instance.getNetworkName()
 	_, err := m.cli.NetworkCreate(m.ctx, netname, netSpec)
+	if errdefs.IsConflict(err) {
+		// A leftover of an earlier instance with this id: remove it and create
+		// again. One with endpoints still attached refuses removal.
+		m.log.warnf("stale challenge network %s already exists; removing it and retrying", netname)
+		_, rmErr := m.cli.NetworkRemove(m.ctx, netname, client.NetworkRemoveOptions{})
+		if rmErr != nil && !errdefs.IsNotFound(rmErr) {
+			err = fmt.Errorf("%w (stale network not removed: %w)", err, rmErr)
+		} else {
+			_, err = m.cli.NetworkCreate(m.ctx, netname, netSpec)
+		}
+	}
 	if err != nil {
 		m.log.errorf("could not create challenge network (%s): %s", netname, err)
 	}

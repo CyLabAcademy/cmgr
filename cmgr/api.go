@@ -300,7 +300,7 @@ func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string) (
 				portName := revPortMap[portStr]
 				hostPort, err := m.reservePort(iMeta.Id, portName)
 				if err != nil {
-					m.stopInstance(iMeta)
+					m.dropFailedLaunch(iMeta.Id)
 					return 0, err
 				}
 				iMeta.Ports[portName] = hostPort
@@ -310,7 +310,7 @@ func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string) (
 
 	err = m.startNetwork(iMeta, cMeta.ChallengeOptions.NetworkOptions)
 	if err != nil {
-		m.stopInstance(iMeta)
+		m.dropFailedLaunch(iMeta.Id)
 		return 0, err
 	}
 
@@ -342,6 +342,15 @@ func (m *Manager) Stop(instance InstanceId) error {
 		return errors.New("locked build: change the schema definition to stop this instance")
 	}
 	return m.stopInstance(iMeta)
+}
+
+// dropFailedLaunch removes the record of a launch that failed before it
+// created its network, so a network of that name is not its to remove. The
+// port reservations go with the row.
+func (m *Manager) dropFailedLaunch(instance InstanceId) {
+	if err := m.removeInstanceMetadata(instance); err != nil {
+		m.log.errorf("could not remove the record of failed launch %d: %s", instance, err)
+	}
 }
 
 func (m *Manager) stopInstance(instance *InstanceMetadata) error {

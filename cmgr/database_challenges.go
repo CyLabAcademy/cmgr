@@ -345,11 +345,15 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 					// retention guarantee.
 					build.PrevChecksum = rotatedPrevChecksum(oldChecksum, build.Checksum, build.PrevChecksum)
 
-					// Update database
+					// Update database, then serve the archive it describes
 					err = m.finalizeBuild(build)
 					if err != nil {
+						m.discardArtifacts(build)
 						errs = append(errs, err)
 						continue
+					}
+					if err = m.promoteArtifacts(build); err != nil {
+						errs = append(errs, err)
 					}
 
 					// Stop and tear down existing instances. For persistent (non-on-demand)

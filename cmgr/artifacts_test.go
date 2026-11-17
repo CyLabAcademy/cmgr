@@ -381,3 +381,58 @@ func TestCacheArtifactsBoundsUncountedMetadata(t *testing.T) {
 		t.Fatalf("expected the decompressed-size bound to fire, got: %s", err)
 	}
 }
+
+// stageArchive writes content where executeBuild would stage the build's
+// archive and records it on the build.
+func stageArchive(t *testing.T, m *Manager, build *BuildMetadata, content string) {
+	t.Helper()
+	build.stagedArtifacts = filepath.Join(m.artifactsDir, "."+build.getArtifactsFilename()+".staged")
+	if err := os.WriteFile(build.stagedArtifacts, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readServed(t *testing.T, m *Manager, build *BuildMetadata) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(m.artifactsDir, build.getArtifactsFilename()))
+	if os.IsNotExist(err) {
+		return "<none>"
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+// The archive a build is served from changes only when its row is recorded:
+// promoted after finalizeBuild, discarded when the build is not recorded.
+func TestStagedArtifactsPromoteOrDiscard(t *testing.T) {
+	m := &Manager{log: newLogger(DISABLED), artifactsDir: t.TempDir()}
+	build := &BuildMetadata{Id: 7, Challenge: "test/artifacts"}
+
+	stageArchive(t, m, build, "generation 1")
+	if got := readServed(t, m, build); got != "<none>" {
+		t.Fatalf("a staged archive is served before promotion: %q", got)
+	}
+	if err := m.promoteArtifacts(build); err != nil {
+		t.Fatal(err)
+	}
+	if got := readServed(t, m, build); got != "generation 1" {
+		t.Fatalf("served %q after promotion, want generation 1", got)
+	}
+
+	stageArchive(t, m, build, "generation 2")
+	staged := build.stagedArtifacts
+	m.discardArtifacts(build)
+	if _, err := os.Stat(staged); !os.IsNotExist(err) {
+		t.Fatalf("the discarded archive is still on disk: %v", err)
+	}
+	if got := readServed(t, m, build); got != "generation 1" {
+		t.Fatalf("served %q after a discard, want generation 1 untouched", got)
+	}
+	if err := m.promoteArtifacts(build); err != nil {
+		t.Fatal(err)
+	}
+	if got := readServed(t, m, build); got != "generation 1" {
+		t.Fatalf("served %q after promoting nothing, want generation 1", got)
+	}
+}

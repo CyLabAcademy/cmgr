@@ -126,12 +126,17 @@ func (m *Manager) loadMarkdownChallenge(path string, info os.FileInfo) (*Challen
 			continue
 		}
 
+		// Text that is not a '- key: value' line, or a value that does not
+		// parse, fails the load rather than leaving a field at its zero value.
+		// An unknown key is ignored, so that a problem.md written for a newer
+		// loader (cork's difficulty, say) still loads.
 		if match == nil {
-			err = fmt.Errorf("unrecognized metadata text on line %d: %s", idx, path)
+			err = fmt.Errorf("unrecognized metadata text on line %d (header lines are '- key: value'): %s", idx, path)
 			m.log.error(err)
-			continue
+			return nil, err
 		}
 
+		var valueErr error
 		switch strings.ToLower(match[1]) {
 		case "id":
 			md.Id = ChallengeId(match[2])
@@ -142,20 +147,18 @@ func (m *Manager) loadMarkdownChallenge(path string, info os.FileInfo) (*Challen
 		case "category":
 			md.Category = match[2]
 		case "templatable":
-			val, tmpErr := parseBool(match[2])
-			md.Templatable = val
-			err = tmpErr
+			md.Templatable, valueErr = parseBool(match[2])
 		case "points":
-			i, tmpErr := strconv.Atoi(match[2])
-			md.Points = i
-			err = tmpErr
+			md.Points, valueErr = strconv.Atoi(match[2])
 		case "maxusers":
-			i, tmpErr := strconv.Atoi(match[2])
-			md.MaxUsers = i
-			err = tmpErr
+			md.MaxUsers, valueErr = strconv.Atoi(match[2])
 		default:
-			err = fmt.Errorf("unrecognized top-level attribute '%s' on line %d: %s", match[1], idx, path)
+			m.log.warnf("ignoring unrecognized top-level attribute '%s' on line %d: %s", match[1], idx, path)
+		}
+		if valueErr != nil {
+			err = fmt.Errorf("invalid value for '%s' on line %d: %w: %s", match[1], idx, valueErr, path)
 			m.log.error(err)
+			return nil, err
 		}
 	}
 

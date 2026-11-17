@@ -713,3 +713,41 @@ func TestLoadMarkdownChallengeOptionsFenceTolerance(t *testing.T) {
 		})
 	}
 }
+
+func loadHeaderFixture(t *testing.T, header string) (*ChallengeMetadata, error) {
+	t.Helper()
+	content := "# Header Challenge\n\n- Namespace: cmgr/test\n- Type: custom\n" + header + "\n## Description\n\nA challenge.\n"
+	path := filepath.Join(t.TempDir(), "problem.md")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write problem.md: %s", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("failed to stat problem.md: %s", err)
+	}
+	return newTestManager().loadMarkdownChallenge(path, info)
+}
+
+// A header value that does not parse, or a header line that is not a
+// '- key: value' bullet, used to load the challenge with the field at its
+// zero value.
+func TestLoadMarkdownChallengeFailsOnBadHeaderValue(t *testing.T) {
+	for _, line := range []string{"- Points: ten", "- MaxUsers: x", "- Templatable: maybe", "* Points: 100", "Points are doubled this week"} {
+		t.Run(line, func(t *testing.T) {
+			if md, err := loadHeaderFixture(t, line+"\n"); err == nil {
+				t.Fatalf("expected the load to fail, got points=%d maxusers=%d templatable=%v", md.Points, md.MaxUsers, md.Templatable)
+			}
+		})
+	}
+}
+
+// An unknown key, such as one a newer loader understands, is ignored.
+func TestLoadMarkdownChallengeIgnoresUnknownHeaderKey(t *testing.T) {
+	md, err := loadHeaderFixture(t, "- Points: 50\n- Difficulty: easy\n")
+	if err != nil {
+		t.Fatalf("load failed: %s", err)
+	}
+	if md.Points != 50 {
+		t.Fatalf("points = %d, want 50", md.Points)
+	}
+}

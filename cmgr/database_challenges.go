@@ -356,12 +356,9 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 						errs = append(errs, err)
 					}
 
-					// Stop and tear down existing instances. For persistent (non-on-demand)
-					// instances also restart them with the new image. On-demand (dynamic)
-					// instances are started per-user with injected env vars, so they are
-					// only torn down here and not restarted. Non-service challenges never
-					// run instances, so any found here are placeholders left by older
-					// versions of cmgr and are removed entirely.
+					// Persistent instances restart in place on the new images. On-demand
+					// ones cannot (their launch env is not kept), so they are removed
+					// and the front-end relaunches; so are any of a non-service challenge.
 					revPortMap, err := m.getReversePortMap(build.Challenge)
 					if err != nil {
 						errs = append(errs, err)
@@ -374,8 +371,21 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 					}
 					for _, iid := range instances {
 						instance, err := m.lookupInstanceMetadata(iid)
-						found := err == nil
-						if err == nil && !cMeta.NeedsInstance() {
+						if err != nil {
+							errs = append(errs, err)
+							continue
+						}
+						// An unfinalized row is a launch in flight, or a crashed one the
+						// prune will remove: stopping it would delete the row under a live
+						// launch. Warned, not an error, since a crashed one never goes away
+						// by running update again.
+						if !instance.IsFinalized {
+							if build.InstanceCount != DYNAMIC_INSTANCES {
+								m.log.warnf("instance %d of build %d had not finished launching when the build was rebuilt; if it is running, it may be on the previous build", instance.Id, build.Id)
+							}
+							continue
+						}
+						if build.InstanceCount == DYNAMIC_INSTANCES || !cMeta.NeedsInstance() {
 							if err = m.stopInstance(instance); err != nil {
 								errs = append(errs, err)
 							}
@@ -384,28 +394,23 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 						// stopContainers releases the port assignments; the
 						// restart below reclaims them (same numbers when free)
 						// so the instance keeps its address across the rebuild.
-						var previousPorts map[string]int
-						if err == nil {
-							previousPorts = instance.Ports
-							err = m.stopContainers(instance)
-						}
+						previousPorts := instance.Ports
+						err = m.stopContainers(instance)
 						if err == nil {
 							err = m.stopNetwork(instance)
 						}
-						if err == nil && build.InstanceCount != DYNAMIC_INSTANCES {
+						if err == nil {
 							err = m.reassignPorts(build, instance, revPortMap, previousPorts)
 						}
-						if err == nil && build.InstanceCount != DYNAMIC_INSTANCES {
+						if err == nil {
 							err = m.startNetwork(instance, cMeta.ChallengeOptions.NetworkOptions)
 						}
-						if err == nil && build.InstanceCount != DYNAMIC_INSTANCES {
+						if err == nil {
 							err = m.startContainers(build, instance, cMeta.ChallengeOptions.Overrides, nil, revPortMap)
 						}
 						if err != nil {
 							errs = append(errs, err)
-							if found && build.InstanceCount != DYNAMIC_INSTANCES {
-								m.rollbackRestart(instance)
-							}
+							m.rollbackRestart(instance)
 						}
 					}
 

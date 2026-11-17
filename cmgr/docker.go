@@ -835,14 +835,10 @@ func (m *Manager) stopNetwork(instance *InstanceMetadata) error {
 	return err
 }
 
-// portsAlreadyKnown reports whether every published port for an image already has
-// a non-zero host port reserved in ports, so the post-start read-back in
-// startContainers can be safely skipped. It is false when explicit ports are
-// disabled (portLow == 0, Docker assigns ephemeral ports) or when any required
-// port is unassigned — e.g. the rebuild flow, which clears instance.Ports before
-// restarting and so must read the bound port back. A port whose name is missing
-// from revPortMap is treated as unknown (false): without a resolvable name we
-// cannot confirm its reservation, and must not skip the read-back.
+// portsAlreadyKnown reports whether every published port for an image already
+// has a host port reserved in ports, so startContainers can skip reading the
+// bound ports back. Never without a port range, where Docker picks them, nor
+// for a port missing from revPortMap, whose reservation cannot be confirmed.
 func portsAlreadyKnown(portLow int, imagePorts []string, ports map[string]int, revPortMap map[string]string) bool {
 	if portLow == 0 {
 		return false

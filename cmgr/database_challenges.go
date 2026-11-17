@@ -374,17 +374,26 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 					}
 					for _, iid := range instances {
 						instance, err := m.lookupInstanceMetadata(iid)
+						found := err == nil
 						if err == nil && !cMeta.NeedsInstance() {
 							if err = m.stopInstance(instance); err != nil {
 								errs = append(errs, err)
 							}
 							continue
 						}
+						// stopContainers releases the port assignments; the
+						// restart below reclaims them (same numbers when free)
+						// so the instance keeps its address across the rebuild.
+						var previousPorts map[string]int
 						if err == nil {
+							previousPorts = instance.Ports
 							err = m.stopContainers(instance)
 						}
 						if err == nil {
 							err = m.stopNetwork(instance)
+						}
+						if err == nil && build.InstanceCount != DYNAMIC_INSTANCES {
+							err = m.reassignPorts(build, instance, revPortMap, previousPorts)
 						}
 						if err == nil && build.InstanceCount != DYNAMIC_INSTANCES {
 							err = m.startNetwork(instance, cMeta.ChallengeOptions.NetworkOptions)
@@ -394,6 +403,9 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 						}
 						if err != nil {
 							errs = append(errs, err)
+							if found && build.InstanceCount != DYNAMIC_INSTANCES {
+								m.rollbackRestart(instance)
+							}
 						}
 					}
 

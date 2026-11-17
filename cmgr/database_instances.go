@@ -38,21 +38,11 @@ func (m *Manager) reservePort(instance InstanceId, name string) (int, error) {
 			return 0, fmt.Errorf("All ports between %d and %d are in use", m.portLow, m.portHigh)
 		}
 
-		// Atomic claim: INSERT ... SELECT ... WHERE NOT EXISTS
-		query := `INSERT INTO portAssignments(instance, name, port)
-                  SELECT ?, ?, ?
-                  WHERE NOT EXISTS (SELECT 1 FROM portAssignments WHERE port = ?);`
-		res, err := m.db.Exec(query, instance, name, candidate, candidate)
+		claimed, err := m.claimPort(instance, name, candidate)
 		if err != nil {
 			return 0, err
 		}
-
-		rowsAffected, err := res.RowsAffected()
-		if err != nil {
-			return 0, err
-		}
-
-		if rowsAffected == 1 {
+		if claimed {
 			return candidate, nil
 		}
 		// Collision — mark this port as used in the local bitset and retry
@@ -61,6 +51,92 @@ func (m *Manager) reservePort(instance InstanceId, name string) (int, error) {
 	}
 
 	return 0, fmt.Errorf("failed to reserve a port after 50 attempts due to high contention")
+}
+
+// claimPort records the given host port for the instance if nobody else
+// holds it. The INSERT ... WHERE NOT EXISTS is the atomic check-and-claim
+// reservePort relies on under concurrent launches.
+func (m *Manager) claimPort(instance InstanceId, name string, port int) (bool, error) {
+	query := `INSERT INTO portAssignments(instance, name, port)
+              SELECT ?, ?, ?
+              WHERE NOT EXISTS (SELECT 1 FROM portAssignments WHERE port = ?);`
+	res, err := m.db.Exec(query, instance, name, port, port)
+	if err != nil {
+		return false, err
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rowsAffected == 1, nil
+}
+
+// reassignPorts reserves the ports of an instance restarted in place, which
+// stopContainers released: each keeps its previous number while that is free
+// and in range, so players keep their address. A failure releases them all.
+// No-op without a port range, where Docker picks the ports.
+func (m *Manager) reassignPorts(build *BuildMetadata, instance *InstanceMetadata, revPortMap map[string]string, previous map[string]int) error {
+	if m.portLow == 0 {
+		return nil
+	}
+	instance.Ports = make(map[string]int)
+	err := m.reassignPortsUnchecked(build, instance, revPortMap, previous)
+	if err != nil {
+		m.releasePorts(instance)
+	}
+	return err
+}
+
+func (m *Manager) reassignPortsUnchecked(build *BuildMetadata, instance *InstanceMetadata, revPortMap map[string]string, previous map[string]int) error {
+	for _, image := range build.Images {
+		if image.Host == "builder" {
+			continue
+		}
+		for _, portStr := range image.Ports {
+			name, ok := revPortMap[portStr]
+			if !ok || name == "" {
+				return fmt.Errorf("no published port name for %s of instance %d", portStr, instance.Id)
+			}
+			if prev, ok := previous[name]; ok && prev >= m.portLow && prev <= m.portHigh {
+				claimed, err := m.claimPort(instance.Id, name, prev)
+				if err != nil {
+					return err
+				}
+				if claimed {
+					instance.Ports[name] = prev
+					continue
+				}
+				m.log.warnf("port %d of instance %d was taken during its restart; assigning a new one", prev, instance.Id)
+			}
+			port, err := m.reservePort(instance.Id, name)
+			if err != nil {
+				return err
+			}
+			instance.Ports[name] = port
+		}
+	}
+	return nil
+}
+
+// rollbackRestart removes what a failed in-place restart brought up and the
+// ports it held, keeping the instance row. Its own errors are only logged.
+func (m *Manager) rollbackRestart(instance *InstanceMetadata) {
+	if err := m.stopContainers(instance); err != nil {
+		m.log.warnf("could not remove the containers of instance %d after its failed restart: %s", instance.Id, err)
+	}
+	if err := m.stopNetwork(instance); err != nil {
+		m.log.warnf("could not remove the network of instance %d after its failed restart: %s", instance.Id, err)
+	}
+	m.releasePorts(instance)
+}
+
+// releasePorts drops every port assignment recorded for the instance, both
+// in the database and on the metadata.
+func (m *Manager) releasePorts(instance *InstanceMetadata) {
+	if _, err := m.db.Exec("DELETE FROM portAssignments WHERE instance=?;", instance.Id); err != nil {
+		m.log.errorf("failed to release the ports of instance %d: %s", instance.Id, err)
+	}
+	instance.Ports = make(map[string]int)
 }
 
 func (m *Manager) openInstance(meta *InstanceMetadata) error {

@@ -618,3 +618,98 @@ func TestTagLineRegex(t *testing.T) {
 		}
 	}
 }
+
+// TestLoadMarkdownChallengeFailsOnSectionError verifies that an error while
+// processing a markdown section — here a duplicate mapping key, which yaml v3
+// rejects — fails the whole load rather than being logged and swallowed. A
+// swallowed error would load the challenge with zeroed container options and
+// deploy it without its declared hardening.
+func TestLoadMarkdownChallengeFailsOnSectionError(t *testing.T) {
+	mgr := newTestManager()
+
+	content := `# Dup Key Challenge
+
+- Namespace: cmgr/test
+- Type: custom
+- Category: test
+- Points: 1
+
+## Description
+
+A challenge.
+
+## Challenge Options
+
+` + "```yaml" + `
+memory: 512m
+memory: 1g
+` + "```" + `
+`
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "problem.md")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write problem.md: %s", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("failed to stat problem.md: %s", err)
+	}
+
+	if _, err := mgr.loadMarkdownChallenge(path, info); err == nil {
+		t.Fatal("expected loadMarkdownChallenge to fail on duplicate challenge-options key, got nil error")
+	}
+}
+
+// loadOptionsFixture writes a problem.md whose "challenge options" section is
+// body, verbatim, and loads it.
+func loadOptionsFixture(t *testing.T, body string) (*ChallengeMetadata, error) {
+	t.Helper()
+	content := "# Options Challenge\n\n- Namespace: cmgr/test\n- Type: custom\n\n## Description\n\nA challenge.\n\n## Challenge Options\n\n" + body
+	path := filepath.Join(t.TempDir(), "problem.md")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write problem.md: %s", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("failed to stat problem.md: %s", err)
+	}
+	return newTestManager().loadMarkdownChallenge(path, info)
+}
+
+// A fence problem used to be overwritten by the parse of an empty range, which
+// loaded the challenge with no options at all.
+func TestLoadMarkdownChallengeFailsOnBadOptionsFence(t *testing.T) {
+	for name, body := range map[string]string{
+		"unclosed":        "```yaml\nmemory: 512m\n",
+		"unopened":        "memory: 512m\n```\n",
+		"two blocks":      "```yaml\nmemory: 512m\n```\n\n```yaml\npidslimit: 64\n```\n",
+		"close then open": "```\nmemory: 512m\n```yaml\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if md, err := loadOptionsFixture(t, body); err == nil {
+				t.Fatalf("expected the load to fail, got options %+v", md.ChallengeOptions.ContainerOptions)
+			}
+		})
+	}
+}
+
+// Fences are matched trimmed: a CRLF file or a trailing space on a fence still
+// delimits the block, and its options apply.
+func TestLoadMarkdownChallengeOptionsFenceTolerance(t *testing.T) {
+	for name, body := range map[string]string{
+		"crlf":           "```yaml\r\nmemory: 512m\r\npidslimit: 64\r\n```\r\n",
+		"trailing space": "```yaml \nmemory: 512m\npidslimit: 64\n``` \n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			md, err := loadOptionsFixture(t, body)
+			if err != nil {
+				t.Fatalf("load failed: %s", err)
+			}
+			opts := md.ChallengeOptions.ContainerOptions
+			if opts.Memory != "512m" || opts.PidsLimit != 64 {
+				t.Fatalf("options did not apply: memory=%q pidslimit=%d", opts.Memory, opts.PidsLimit)
+			}
+		})
+	}
+}

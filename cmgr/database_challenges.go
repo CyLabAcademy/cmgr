@@ -122,8 +122,10 @@ func (m *Manager) lookupChallengeMetadata(challenge ChallengeId) (*ChallengeMeta
 		err = txn.Select(containerOptions, "SELECT host, init, cpus, memory, ulimits, pidslimit, readonlyrootfs, droppedcaps, nonewprivileges, diskquota, cgroupparent, capimmutable, seccomp FROM containerOptions WHERE challenge=?", challenge)
 	}
 	for _, dbOpts := range *containerOptions {
-		cOpts, err := newFromDbContainerOptions(dbOpts)
+		var cOpts ContainerOptions
+		cOpts, err = newFromDbContainerOptions(dbOpts)
 		if err != nil {
+			m.log.errorf("could not decode container options for '%s' (host '%s'): %s", challenge, dbOpts.Host, err)
 			break
 		}
 		if metadata.ChallengeOptions.Overrides == nil {

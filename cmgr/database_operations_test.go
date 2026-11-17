@@ -1794,3 +1794,40 @@ func TestInitDatabaseRepairsStaleIsFinalizedDefault(t *testing.T) {
 		t.Errorf("expected new instance to default to is_finalized=0, got %d", fresh)
 	}
 }
+
+// TestLookupChallengeMetadataSurfacesOptionsDecodeError verifies that a
+// containerOptions row that fails to decode (e.g. a corrupt seccomp column)
+// causes lookupChallengeMetadata to return an error instead of silently
+// returning the challenge with no container options — which would launch
+// instances without any of their declared hardening.
+func TestLookupChallengeMetadataSurfacesOptionsDecodeError(t *testing.T) {
+	mgr := setupTestManager(t)
+	defer mgr.db.Close()
+
+	challenge := &ChallengeMetadata{
+		Id:            "test/corrupt-options",
+		Name:          "Corrupt Options",
+		Namespace:     "test",
+		ChallengeType: "custom",
+		Hosts:         []HostInfo{{Name: "challenge", Target: ""}},
+		PortMap:       map[string]PortInfo{},
+		Path:          "/tmp/test/problem.md",
+		ChallengeOptions: ChallengeOptions{
+			Overrides: map[string]ContainerOptions{
+				"": {ReadonlyRootfs: true},
+			},
+		},
+	}
+
+	if errs := mgr.addChallenges([]*ChallengeMetadata{challenge}); len(errs) > 0 {
+		t.Fatalf("addChallenges failed: %v", errs)
+	}
+
+	if _, err := mgr.db.Exec("UPDATE containerOptions SET seccomp='{not json' WHERE challenge=?", challenge.Id); err != nil {
+		t.Fatalf("failed to corrupt seccomp column: %s", err)
+	}
+
+	if _, err := mgr.lookupChallengeMetadata(challenge.Id); err == nil {
+		t.Fatal("expected lookupChallengeMetadata to fail on a corrupt seccomp column, got nil error")
+	}
+}

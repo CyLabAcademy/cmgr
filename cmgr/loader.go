@@ -1,11 +1,14 @@
 package cmgr
 
 import (
+	"errors"
 	"fmt"
 	"io/ioutil"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -120,18 +123,24 @@ const shortLinkAsRePattern string = `\{\{\s*link_as\(["']` + urlPathPattern + `[
 var shortLinkAsRe *regexp.Regexp = regexp.MustCompile(shortLinkAsRePattern)
 
 func (m *Manager) validateMetadata(md *ChallengeMetadata) error {
+	// Every problem is reported, so an author with several sees them all.
+	var problems []error
+	note := func(err error) error {
+		problems = append(problems, err)
+		return err
+	}
 	var lastErr error
 	// Require a challenge name
 	if md.Name == "" {
-		lastErr = fmt.Errorf("challenge file missing name: %s", md.Path)
+		lastErr = note(fmt.Errorf("challenge file missing name: %s", md.Path))
 		m.log.error(lastErr)
 	}
 
 	// Validate Namespace
 	re := regexp.MustCompile(`^([a-z0-9]+(/[a-z0-9]+)*)?$`)
 	if !re.MatchString(md.Namespace) {
-		lastErr = fmt.Errorf("invalid namespace (limited to lowercase letters, numerals, and '/') of '%s': %s",
-			md.Namespace, md.Path)
+		lastErr = note(fmt.Errorf("invalid namespace (limited to lowercase letters, numerals, and '/') of '%s': %s",
+			md.Namespace, md.Path))
 		m.log.error(lastErr)
 	}
 
@@ -139,42 +148,42 @@ func (m *Manager) validateMetadata(md *ChallengeMetadata) error {
 	// picoCTF fork customization: allow template strings not involving connection information in the description section
 	templates := httpBaseRe.FindAllString(md.Description, -1)
 	if len(templates) > 0 {
-		lastErr = fmt.Errorf("'http_base' template strings not allowed in the 'description' field, but found: %s", strings.Join(templates, ", "))
+		lastErr = note(fmt.Errorf("'http_base' template strings not allowed in the 'description' field, but found: %s", strings.Join(templates, ", ")))
 		m.log.error(lastErr)
 	}
 	templates = shortHttpBaseRe.FindAllString(md.Description, -1)
 	if len(templates) > 0 {
-		lastErr = fmt.Errorf("'http_base' template strings not allowed in the 'description' field, but found: %s", strings.Join(templates, ", "))
+		lastErr = note(fmt.Errorf("'http_base' template strings not allowed in the 'description' field, but found: %s", strings.Join(templates, ", ")))
 		m.log.error(lastErr)
 	}
 	templates = portRe.FindAllString(md.Description, -1)
 	if len(templates) > 0 {
-		lastErr = fmt.Errorf("'port' template strings not allowed in the 'description' field, but found: %s", strings.Join(templates, ", "))
+		lastErr = note(fmt.Errorf("'port' template strings not allowed in the 'description' field, but found: %s", strings.Join(templates, ", ")))
 		m.log.error(lastErr)
 	}
 	templates = shortPortRe.FindAllString(md.Description, -1)
 	if len(templates) > 0 {
-		lastErr = fmt.Errorf("'port' template strings not allowed in the 'description' field, but found: %s", strings.Join(templates, ", "))
+		lastErr = note(fmt.Errorf("'port' template strings not allowed in the 'description' field, but found: %s", strings.Join(templates, ", ")))
 		m.log.error(lastErr)
 	}
 	templates = serverRe.FindAllString(md.Description, -1)
 	if len(templates) > 0 {
-		lastErr = fmt.Errorf("'server' template strings not allowed in the 'description' field, but found: %s", strings.Join(templates, ", "))
+		lastErr = note(fmt.Errorf("'server' template strings not allowed in the 'description' field, but found: %s", strings.Join(templates, ", ")))
 		m.log.error(lastErr)
 	}
 	templates = shortServerRe.FindAllString(md.Description, -1)
 	if len(templates) > 0 {
-		lastErr = fmt.Errorf("'server' template strings not allowed in the 'description' field, but found: %s", strings.Join(templates, ", "))
+		lastErr = note(fmt.Errorf("'server' template strings not allowed in the 'description' field, but found: %s", strings.Join(templates, ", ")))
 		m.log.error(lastErr)
 	}
 	templates = linkRe.FindAllString(md.Description, -1)
 	if len(templates) > 0 {
-		lastErr = fmt.Errorf("'link' template strings not allowed in the 'description' field, but found: %s", strings.Join(templates, ", "))
+		lastErr = note(fmt.Errorf("'link' template strings not allowed in the 'description' field, but found: %s", strings.Join(templates, ", ")))
 		m.log.error(lastErr)
 	}
 	templates = shortLinkRe.FindAllString(md.Description, -1)
 	if len(templates) > 0 {
-		lastErr = fmt.Errorf("'link' template strings not allowed in the 'description' field, but found: %s", strings.Join(templates, ", "))
+		lastErr = note(fmt.Errorf("'link' template strings not allowed in the 'description' field, but found: %s", strings.Join(templates, ", ")))
 		m.log.error(lastErr)
 	}
 
@@ -301,13 +310,13 @@ func (m *Manager) validateMetadata(md *ChallengeMetadata) error {
 
 	res, err := normalizeAndCheckTemplated(md.Description)
 	if err != nil {
-		lastErr = err
+		lastErr = note(err)
 	}
 	md.Description = res
 
 	res, err = normalizeAndCheckTemplated(md.Details)
 	if err != nil {
-		lastErr = err
+		lastErr = note(err)
 	}
 	md.Details = res
 
@@ -315,7 +324,7 @@ func (m *Manager) validateMetadata(md *ChallengeMetadata) error {
 		res, err = normalizeAndCheckTemplated(hint)
 
 		if err != nil {
-			lastErr = err
+			lastErr = note(err)
 		}
 
 		md.Hints[i] = res
@@ -323,7 +332,7 @@ func (m *Manager) validateMetadata(md *ChallengeMetadata) error {
 
 	for port, used := range refPort {
 		if !used {
-			lastErr = fmt.Errorf("port '%s' published but not referenced: %s", port, md.Path)
+			lastErr = note(fmt.Errorf("port '%s' published but not referenced: %s", port, md.Path))
 			m.log.error(lastErr)
 		}
 	}
@@ -337,7 +346,7 @@ func (m *Manager) validateMetadata(md *ChallengeMetadata) error {
 
 		if opts.Seccomp != nil {
 			if err := opts.Seccomp.resolve(md.Path); err != nil {
-				lastErr = fmt.Errorf("%s%s", hostStr, err)
+				lastErr = note(fmt.Errorf("%s%s", hostStr, err))
 				m.log.error(lastErr)
 			}
 		}
@@ -345,7 +354,7 @@ func (m *Manager) validateMetadata(md *ChallengeMetadata) error {
 		if opts.Cpus != "" {
 			_, err := parseNanoCPUs(opts.Cpus)
 			if err != nil {
-				lastErr = fmt.Errorf("%serror parsing cpus container option: %v", hostStr, err)
+				lastErr = note(fmt.Errorf("%serror parsing cpus container option: %v", hostStr, err))
 				m.log.error(lastErr)
 			}
 		}
@@ -353,7 +362,7 @@ func (m *Manager) validateMetadata(md *ChallengeMetadata) error {
 		if opts.Memory != "" {
 			_, err = units.RAMInBytes(opts.Memory)
 			if err != nil {
-				lastErr = fmt.Errorf("%serror parsing memory container option: %v", hostStr, err)
+				lastErr = note(fmt.Errorf("%serror parsing memory container option: %v", hostStr, err))
 				m.log.error(lastErr)
 			}
 		}
@@ -361,18 +370,18 @@ func (m *Manager) validateMetadata(md *ChallengeMetadata) error {
 		for _, ulimit := range opts.Ulimits {
 			limit, err := units.ParseUlimit(ulimit)
 			if err != nil {
-				lastErr = fmt.Errorf("%serror parsing ulimits container option: %v", hostStr, err)
+				lastErr = note(fmt.Errorf("%serror parsing ulimits container option: %v", hostStr, err))
 				m.log.error(lastErr)
 			}
 			// See https://docs.docker.com/engine/reference/commandline/run/#set-ulimits-in-container---ulimit
 			if limit.Name == "nproc" {
-				lastErr = fmt.Errorf("%snproc ulimits are not supported, use the pidslimit container option instead", hostStr)
+				lastErr = note(fmt.Errorf("%snproc ulimits are not supported, use the pidslimit container option instead", hostStr))
 				m.log.error(lastErr)
 			}
 		}
 
 		if opts.PidsLimit < -1 {
-			lastErr = fmt.Errorf("%sinvalid pidslimit container option (must be >= -1)", hostStr)
+			lastErr = note(fmt.Errorf("%sinvalid pidslimit container option (must be >= -1)", hostStr))
 			m.log.error(lastErr)
 		}
 
@@ -396,7 +405,7 @@ func (m *Manager) validateMetadata(md *ChallengeMetadata) error {
 		for _, cap := range opts.DroppedCaps {
 			if _, ok := droppable_capabilities[cap]; !ok {
 				if _, ok = droppable_capabilities[fmt.Sprintf("CAP_%s", cap)]; !ok {
-					lastErr = fmt.Errorf("%sinvalid DroppedCaps container option: %s", hostStr, cap)
+					lastErr = note(fmt.Errorf("%sinvalid DroppedCaps container option: %s", hostStr, cap))
 					m.log.error(lastErr)
 				}
 			}
@@ -405,13 +414,13 @@ func (m *Manager) validateMetadata(md *ChallengeMetadata) error {
 		if opts.DiskQuota != "" {
 			_, err := units.RAMInBytes(opts.DiskQuota) // Despite its name, Docker uses this method to parse the size= storage option.
 			if err != nil {
-				lastErr = fmt.Errorf("%serror parsing DiskQuota container option: %v", hostStr, err)
+				lastErr = note(fmt.Errorf("%serror parsing DiskQuota container option: %v", hostStr, err))
 				m.log.error(lastErr)
 			}
 		}
 	}
 
-	return lastErr
+	return errors.Join(problems...)
 }
 
 func (m *Manager) validateBuild(cMeta *ChallengeMetadata, md *BuildMetadata, files []string) error {
@@ -427,14 +436,19 @@ func (m *Manager) validateBuild(cMeta *ChallengeMetadata, md *BuildMetadata, fil
 	}
 	m.log.debugf("lookups: %#v", refLookup)
 
-	checkTemplated := func(s string) error {
-		var err error
+	// Every problem is reported, so an author with two mistakes sees both.
+	var problems []error
+	report := func(format string, args ...interface{}) {
+		err := fmt.Errorf(format, args...)
+		m.log.error(err)
+		problems = append(problems, err)
+	}
+
+	checkTemplated := func(s string) {
 		fileRefs := urlRe.FindAllStringSubmatch(s, -1)
 		for _, ref := range fileRefs {
-			_, ok := refFile[ref[1]]
-			if !ok {
-				err = fmt.Errorf("unknown artifact '%s' referenced with '%s': %s/%d", ref[1], ref[0], md.Challenge, md.Id)
-				m.log.error(err)
+			if _, ok := refFile[ref[1]]; !ok {
+				report("unknown artifact '%s' referenced with '%s': %s/%d", ref[1], ref[0], md.Challenge, md.Id)
 			} else {
 				refFile[ref[1]] = true
 			}
@@ -442,44 +456,31 @@ func (m *Manager) validateBuild(cMeta *ChallengeMetadata, md *BuildMetadata, fil
 
 		lookupRefs := lookupRe.FindAllStringSubmatch(s, -1)
 		for _, ref := range lookupRefs {
-			_, ok := refLookup[ref[1]]
-			if !ok {
-				err = fmt.Errorf("unknown lookup key of '%s' referenced with '%s': %s/%d", ref[1], ref[0], md.Challenge, md.Id)
-				m.log.error(err)
+			if _, ok := refLookup[ref[1]]; !ok {
+				report("unknown lookup key of '%s' referenced with '%s': %s/%d", ref[1], ref[0], md.Challenge, md.Id)
 			} else {
 				refLookup[ref[1]] = true
 			}
 		}
-
-		return err
 	}
 
 	// Validate templated fields
-	err := checkTemplated(cMeta.Description)
-	detailsErr := checkTemplated(cMeta.Details)
-	if detailsErr != nil {
-		err = detailsErr
-	}
-
+	checkTemplated(cMeta.Description)
+	checkTemplated(cMeta.Details)
 	for _, hint := range cMeta.Hints {
-		tmpErr := checkTemplated(hint)
+		checkTemplated(hint)
+	}
 
-		if tmpErr != nil {
-			err = tmpErr
+	// Sorted, so the same challenge reports its problems in the same order.
+	for _, f := range slices.Sorted(maps.Keys(refFile)) {
+		if !refFile[f] {
+			report("artifact file '%s' published but not referenced: %s/%d", f, md.Challenge, md.Id)
 		}
 	}
 
-	for f, used := range refFile {
-		if !used {
-			err = fmt.Errorf("artifact file '%s' published but not referenced: %s/%d", f, md.Challenge, md.Id)
-			m.log.error(err)
-		}
-	}
-
-	for key, used := range refLookup {
-		if !used {
-			err = fmt.Errorf("lookup value '%s' published but not referenced: %s/%d", key, md.Challenge, md.Id)
-			m.log.error(err)
+	for _, key := range slices.Sorted(maps.Keys(refLookup)) {
+		if !refLookup[key] {
+			report("lookup value '%s' published but not referenced: %s/%d", key, md.Challenge, md.Id)
 		}
 	}
 
@@ -494,7 +495,7 @@ func (m *Manager) validateBuild(cMeta *ChallengeMetadata, md *BuildMetadata, fil
 		m.log.warnf("challenge publishes no ports and produces no artifacts (missing a '# PUBLISH' directive? if intentional, use the 'flag-only' type): %s/%d", md.Challenge, md.Id)
 	}
 
-	return err
+	return errors.Join(problems...)
 }
 
 // Validates the challenge metadata for compliance with expectations

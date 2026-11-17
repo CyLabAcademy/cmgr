@@ -375,9 +375,17 @@ func printChanges(status *cmgr.ChallengeUpdates, verbose bool) {
 	if len(status.Errors) != 0 {
 		fmt.Println("Errors:")
 		for idx, err := range status.Errors {
-			fmt.Printf("    %d) %s\n", idx+1, err)
+			fmt.Printf("    %d) %s\n", idx+1, indentContinuation(fmt.Sprint(err), "       "))
 		}
 	}
+}
+
+// indentContinuation lines the later lines of a multi-line message up under
+// the first. A single error can report several problems at once
+// (validateBuild returns every one it found, joined); without this all but
+// the first sit flush against the margin.
+func indentContinuation(msg, indent string) string {
+	return strings.ReplaceAll(strings.TrimRight(msg, "\n"), "\n", "\n"+indent)
 }
 
 // getMetaByDir returns the unmodified challenges under dir and whether the
@@ -401,7 +409,7 @@ func getMetaByDir(m *cmgr.Manager, dir string) ([]*cmgr.ChallengeMetadata, bool)
 	if len(cu.Errors) > 0 {
 		fmt.Println("error: errors occurred during execution:")
 		for i, err := range cu.Errors {
-			fmt.Printf("    %d) %s\n", i+1, err)
+			fmt.Printf("    %d) %s\n", i+1, indentContinuation(fmt.Sprint(err), "       "))
 		}
 		return nil, false
 	}

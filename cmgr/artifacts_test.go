@@ -429,10 +429,27 @@ func TestStagedArtifactsPromoteOrDiscard(t *testing.T) {
 	if got := readServed(t, m, build); got != "generation 1" {
 		t.Fatalf("served %q after a discard, want generation 1 untouched", got)
 	}
+}
+
+// A rebuild that publishes no archive any more must not leave the previous
+// generation's archive behind to be served under the build's id.
+func TestPromoteArtifactsRemovesADroppedArchive(t *testing.T) {
+	m := &Manager{log: newLogger(DISABLED), artifactsDir: t.TempDir()}
+	build := &BuildMetadata{Id: 8, Challenge: "test/artifacts"}
+
+	stageArchive(t, m, build, "generation 1")
 	if err := m.promoteArtifacts(build); err != nil {
 		t.Fatal(err)
 	}
-	if got := readServed(t, m, build); got != "generation 1" {
-		t.Fatalf("served %q after promoting nothing, want generation 1", got)
+	// The next generation produced no archive: nothing was staged.
+	if err := m.promoteArtifacts(build); err != nil {
+		t.Fatal(err)
+	}
+	if got := readServed(t, m, build); got != "<none>" {
+		t.Fatalf("served %q after a rebuild without artifacts, want nothing", got)
+	}
+	// And a build that never had one is not an error.
+	if err := m.promoteArtifacts(build); err != nil {
+		t.Fatalf("promoting nothing over nothing failed: %s", err)
 	}
 }

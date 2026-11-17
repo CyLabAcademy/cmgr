@@ -154,15 +154,22 @@ func (b *BuildMetadata) getArtifactsFilename() string {
 }
 
 // promoteArtifacts serves the archive executeBuild staged, once the build row
-// that describes it is committed. The rename is atomic: a download gets the
-// old archive or the new one, never a partial file.
+// that describes it is committed, or removes the previous one when the build
+// produced none. The rename is atomic: a download gets the old archive or the
+// new one, never a partial file.
 func (m *Manager) promoteArtifacts(build *BuildMetadata) error {
 	staged := build.stagedArtifacts
 	build.stagedArtifacts = ""
+	served := filepath.Join(m.artifactsDir, build.getArtifactsFilename())
 	if staged == "" {
+		if err := os.Remove(served); err != nil && !os.IsNotExist(err) {
+			err = fmt.Errorf("could not remove the artifact archive %s/%d no longer publishes: %w", build.Challenge, build.Id, err)
+			m.log.error(err)
+			return err
+		}
 		return nil
 	}
-	if err := os.Rename(staged, filepath.Join(m.artifactsDir, build.getArtifactsFilename())); err != nil {
+	if err := os.Rename(staged, served); err != nil {
 		os.Remove(staged)
 		err = fmt.Errorf("could not promote the artifact archive of %s/%d: %w", build.Challenge, build.Id, err)
 		m.log.error(err)
